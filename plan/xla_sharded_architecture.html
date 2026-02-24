@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XLA-Sharded — System Architecture</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Instrument+Sans:wght@400;500;600;700&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --bg: #08090d;
+    --surface: #0e1018;
+    --surface2: #141620;
+    --surface3: #1a1d2b;
+    --border: #252838;
+    --border-lit: #353950;
+    --text: #cdd1de;
+    --text-dim: #6b7084;
+    --text-bright: #eef0f6;
+    --gpu0: #2d7ff9;
+    --gpu0-dim: rgba(45,127,249,0.12);
+    --gpu1: #9b59f5;
+    --gpu1-dim: rgba(155,89,245,0.12);
+    --draft: #00c48f;
+    --draft-dim: rgba(0,196,143,0.10);
+    --target: #f5a623;
+    --target-dim: rgba(245,166,35,0.10);
+    --cache: #00b4d8;
+    --cache-dim: rgba(0,180,216,0.08);
+    --reject: #ff4757;
+    --accept: #00c48f;
+    --nvlink: #f5a623;
+    --mono: 'IBM Plex Mono', monospace;
+    --sans: 'Instrument Sans', sans-serif;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* === HEADER === */
+  .page-header {
+    padding: 40px 32px 28px;
+    border-bottom: 1px solid var(--border);
+    position: relative;
+  }
+
+  .page-header::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--gpu0), var(--gpu1), transparent);
+  }
+
+  .header-row {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    max-width: 1280px;
+    margin: 0 auto;
+  }
+
+  .header-tag {
+    font-family: var(--mono);
+    font-size: 0.65rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--gpu0);
+    background: var(--gpu0-dim);
+    padding: 4px 10px;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+
+  .page-header h1 {
+    font-family: var(--sans);
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: var(--text-bright);
+    letter-spacing: -0.03em;
+  }
+
+  .page-header .subtitle {
+    color: var(--text-dim);
+    font-size: 0.85rem;
+    max-width: 1280px;
+    margin: 10px auto 0;
+    line-height: 1.5;
+  }
+
+  /* === SECTION TITLES === */
+  .section-label {
+    font-family: var(--mono);
+    font-size: 0.65rem;
+    font-weight: 600;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    padding: 24px 32px 12px;
+    max-width: 1280px;
+    margin: 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .section-label::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  /* === DEVICE MAP === */
+  .device-map-container {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 0 32px 32px;
+    overflow-x: auto;
+  }
+
+  .device-map-svg { display: block; margin: 0 auto; }
+
+  /* === SEQUENCE DIAGRAM === */
+  .sequence-container {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 0 32px 48px;
+    overflow-x: auto;
+  }
+
+  .sequence-svg { display: block; margin: 0 auto; }
+
+  /* === LEGEND === */
+  .legend-bar {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 16px 32px;
+    display: flex;
+    gap: 28px;
+    flex-wrap: wrap;
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    color: var(--text-dim);
+  }
+
+  .lsw {
+    width: 10px;
+    height: 10px;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+
+  /* === DECISION TABLE === */
+  .decisions {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 0 32px 48px;
+  }
+
+  .dec-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 12px;
+  }
+
+  .dec-card {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+
+  .dec-card .label {
+    font-family: var(--mono);
+    font-size: 0.6rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+  }
+
+  .dec-card .value {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--text-bright);
+    line-height: 1.4;
+  }
+
+  .dec-card .detail {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    margin-top: 4px;
+    line-height: 1.4;
+  }
+
+  .locked {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 0.55rem;
+    font-weight: 600;
+    color: var(--accept);
+    background: rgba(0,196,143,0.1);
+    padding: 2px 6px;
+    border-radius: 3px;
+    margin-left: 6px;
+    vertical-align: middle;
+    letter-spacing: 0.08em;
+  }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="page-header">
+  <div class="header-row">
+    <span class="header-tag">PLAN v3 — FINAL</span>
+    <h1>XLA-Sharded: Multi-GPU Speculative Inference Engine</h1>
+  </div>
+  <p class="subtitle">Combined device-map + sequence architecture. Two distinct XLA computation graphs — a 2-layer Draft on GPU 0 and a 12-layer sharded Target across GPU 0+1 — coordinated via speculative decoding with K=5.</p>
+</div>
+
+<!-- DECISIONS -->
+<div class="section-label">LOCKED DECISIONS</div>
+<div class="decisions">
+  <div class="dec-grid">
+    <div class="dec-card">
+      <div class="label">Weights</div>
+      <div class="value">Random Init <span class="locked">LOCKED</span></div>
+      <div class="detail">No pretrained weights. Proves pipeline correctness; benchmarks are valid regardless.</div>
+    </div>
+    <div class="dec-card">
+      <div class="label">Tokenizer</div>
+      <div class="value">Dummy → Gemma SP <span class="locked">LOCKED</span></div>
+      <div class="detail">V1: integer token IDs. V2: Gemma SentencePiece for real text.</div>
+    </div>
+    <div class="dec-card">
+      <div class="label">Speculation K</div>
+      <div class="value">Fixed K = 5 <span class="locked">LOCKED</span></div>
+      <div class="detail">Draft generates 5 tokens per round. Simple, reliable.</div>
+    </div>
+    <div class="dec-card">
+      <div class="label">Draft Placement</div>
+      <div class="value">GPU 0 Only <span class="locked">LOCKED</span></div>
+      <div class="detail">Unsharded. ~50 MB. Cross-device token transfer is negligible (20 bytes).</div>
+    </div>
+    <div class="dec-card">
+      <div class="label">Profile Output</div>
+      <div class="value">Inline Terminal <span class="locked">LOCKED</span></div>
+      <div class="detail">Tokens/sec, TTFT, Acceptance Rate printed live in CLI.</div>
+    </div>
+  </div>
+</div>
+
+<!-- LEGEND -->
+<div class="legend-bar">
+  <div class="legend-item"><div class="lsw" style="background:var(--gpu0)"></div>GPU 0</div>
+  <div class="legend-item"><div class="lsw" style="background:var(--gpu1)"></div>GPU 1</div>
+  <div class="legend-item"><div class="lsw" style="background:var(--draft)"></div>Draft Model (2L)</div>
+  <div class="legend-item"><div class="lsw" style="background:var(--target)"></div>Target Model (12L)</div>
+  <div class="legend-item"><div class="lsw" style="background:var(--cache)"></div>KV-Cache (Static)</div>
+  <div class="legend-item"><div class="lsw" style="background:var(--nvlink)"></div>NVLink / all_reduce</div>
+  <div class="legend-item"><div class="lsw" style="background:var(--accept)"></div>Accept</div>
+  <div class="legend-item"><div class="lsw" style="background:var(--reject)"></div>Reject / Rollback</div>
+</div>
+
+<!-- PART 1: DEVICE MAP -->
+<div class="section-label">PART 1 — DEVICE MAP: WHAT LIVES WHERE</div>
+<div class="device-map-container">
+  <svg class="device-map-svg" width="1060" height="520" viewBox="0 0 1060 520">
+    <defs>
+      <marker id="a-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="#00c48f"/></marker>
+      <marker id="a-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="#f5a623"/></marker>
+      <marker id="a-cyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="#00b4d8"/></marker>
+      <marker id="a-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="#2d7ff9"/></marker>
+
+      <!-- Noise filter for texture -->
+      <filter id="noise" x="0" y="0" width="100%" height="100%">
+        <feTurbulence baseFrequency="0.9" numOctaves="4" result="noise" seed="2"/>
+        <feColorMatrix type="saturate" values="0" in="noise" result="gray"/>
+        <feComponentTransfer in="gray" result="dimNoise">
+          <feFuncA type="linear" slope="0.03"/>
+        </feComponentTransfer>
+        <feBlend in="SourceGraphic" in2="dimNoise" mode="normal"/>
+      </filter>
+    </defs>
+
+    <!-- GPU 0 ENCLOSURE -->
+    <rect x="16" y="16" width="480" height="488" rx="12" fill="var(--surface)" stroke="var(--gpu0)" stroke-width="1.5" filter="url(#noise)"/>
+    <rect x="16" y="16" width="480" height="32" rx="12" fill="rgba(45,127,249,0.08)"/>
+    <rect x="16" y="36" width="480" height="12" fill="rgba(45,127,249,0.08)"/>
+    <circle cx="34" cy="32" r="4" fill="var(--gpu0)" opacity="0.6"/>
+    <text x="48" y="37" fill="var(--gpu0)" font-family="var(--mono)" font-size="11" font-weight="700">GPU 0</text>
+    <text x="460" y="37" fill="var(--text-dim)" font-family="var(--mono)" font-size="9" text-anchor="end">XLA Graph #1 + #2 (shard 0)</text>
+
+    <!-- DRAFT MODEL BOX -->
+    <rect x="36" y="62" width="220" height="178" rx="8" fill="var(--draft-dim)" stroke="var(--draft)" stroke-width="1.2"/>
+    <text x="52" y="82" fill="var(--draft)" font-family="var(--mono)" font-size="10" font-weight="700">DRAFT MODEL</text>
+    <text x="240" y="82" fill="var(--text-dim)" font-family="var(--mono)" font-size="8" text-anchor="end">XLA Graph #1</text>
+    <text x="52" y="98" fill="var(--text-dim)" font-family="var(--mono)" font-size="8.5">Tiny-Transformer · 2 layers · Unsharded</text>
+
+    <!-- Draft layers -->
+    <rect x="48" y="112" width="196" height="24" rx="4" fill="rgba(0,196,143,0.08)" stroke="rgba(0,196,143,0.2)" stroke-width="0.8"/>
+    <text x="146" y="128" fill="var(--draft)" font-family="var(--mono)" font-size="9" text-anchor="middle">Layer 0  GQA-Attn → SwiGLU</text>
+    <rect x="48" y="140" width="196" height="24" rx="4" fill="rgba(0,196,143,0.08)" stroke="rgba(0,196,143,0.2)" stroke-width="0.8"/>
+    <text x="146" y="156" fill="var(--draft)" font-family="var(--mono)" font-size="9" text-anchor="middle">Layer 1  GQA-Attn → SwiGLU</text>
+
+    <!-- Draft embed + head -->
+    <rect x="48" y="172" width="95" height="20" rx="3" fill="rgba(0,196,143,0.05)" stroke="rgba(0,196,143,0.15)" stroke-width="0.6"/>
+    <text x="95" y="185" fill="var(--text-dim)" font-family="var(--mono)" font-size="7.5" text-anchor="middle">embed_tokens</text>
+    <rect x="149" y="172" width="95" height="20" rx="3" fill="rgba(0,196,143,0.05)" stroke="rgba(0,196,143,0.15)" stroke-width="0.6"/>
+    <text x="196" y="185" fill="var(--text-dim)" font-family="var(--mono)" font-size="7.5" text-anchor="middle">lm_head</text>
+
+    <!-- Draft memory -->
+    <rect x="48" y="202" width="196" height="18" rx="3" fill="rgba(0,196,143,0.04)"/>
+    <text x="146" y="215" fill="var(--text-dim)" font-family="var(--mono)" font-size="8" text-anchor="middle">≈ 50 MB (bf16) · vocab=32k · d=768</text>
+
+    <!-- DRAFT KV-CACHE -->
+    <rect x="276" y="62" width="200" height="80" rx="8" fill="var(--cache-dim)" stroke="var(--cache)" stroke-width="1" stroke-dasharray="5 3"/>
+    <text x="292" y="82" fill="var(--cache)" font-family="var(--mono)" font-size="10" font-weight="600">Draft KV-Cache</text>
+    <text x="292" y="97" fill="var(--text-dim)" font-family="var(--mono)" font-size="8">Shape: (2, 2, B, 2048, 4, 64)</text>
+    <text x="292" y="110" fill="var(--text-dim)" font-family="var(--mono)" font-size="8">[layers, KV, batch, seq, heads, dim]</text>
+    <text x="292" y="125" fill="var(--text-dim)" font-family="var(--mono)" font-size="8">≈ 8 MB · static pre-allocated</text>
+
+    <!-- Arrow: draft → draft KV -->
+    <line x1="256" y1="100" x2="274" y2="100" stroke="var(--cache)" stroke-width="1" marker-end="url(#a-cyan)" opacity="0.6"/>
+
+    <!-- TARGET SHARD 0 -->
+    <rect x="36" y="260" width="440" height="226" rx="8" fill="var(--target-dim)" stroke="var(--target)" stroke-width="1.2"/>
+    <text x="52" y="280" fill="var(--target)" font-family="var(--mono)" font-size="10" font-weight="700">TARGET MODEL — SHARD 0/2</text>
+    <text x="460" y="280" fill="var(--text-dim)" font-family="var(--mono)" font-size="8" text-anchor="end">XLA Graph #2 (this device's half)</text>
+    <text x="52" y="296" fill="var(--text-dim)" font-family="var(--mono)" font-size="8.5">12-layer Llama · TP=2 · Half of each weight matrix</text>
+
+    <!-- Target weight blocks -->
+    <rect x="48" y="310" width="200" height="19" rx="3" fill="rgba(245,166,35,0.07)" stroke="rgba(245,166,35,0.18)" stroke-width="0.6"/>
+    <text x="148" y="323" fill="var(--target)" font-family="var(--mono)" font-size="8" text-anchor="middle">L0..11  W_q[:, 0:h/2]</text>
+    <rect x="48" y="332" width="200" height="19" rx="3" fill="rgba(245,166,35,0.07)" stroke="rgba(245,166,35,0.18)" stroke-width="0.6"/>
+    <text x="148" y="345" fill="var(--target)" font-family="var(--mono)" font-size="8" text-anchor="middle">L0..11  W_k[:, 0:kv_h/2]</text>
+    <rect x="48" y="354" width="200" height="19" rx="3" fill="rgba(245,166,35,0.07)" stroke="rgba(245,166,35,0.18)" stroke-width="0.6"/>
+    <text x="148" y="367" fill="var(--target)" font-family="var(--mono)" font-size="8" text-anchor="middle">L0..11  W_v[:, 0:kv_h/2]</text>
+    <rect x="48" y="376" width="200" height="19" rx="3" fill="rgba(245,166,35,0.07)" stroke="rgba(245,166,35,0.18)" stroke-width="0.6"/>
+    <text x="148" y="389" fill="var(--target)" font-family="var(--mono)" font-size="8" text-anchor="middle">L0..11  W_o[h/2:, :]</text>
+    <rect x="48" y="398" width="200" height="19" rx="3" fill="rgba(245,166,35,0.07)" stroke="rgba(245,166,35,0.18)" stroke-width="0.6"/>
+    <text x="148" y="411" fill="var(--target)" font-family="var(--mono)" font-size="8" text-anchor="middle">L0..11  MLP (gate+up)[:, 0:d/2]</text>
+    <rect x="48" y="420" width="200" height="19" rx="3" fill="rgba(245,166,35,0.07)" stroke="rgba(245,166,35,0.18)" stroke-width="0.6"/>
+    <text x="148" y="433" fill="var(--target)" font-family="var(--mono)" font-size="8" text-anchor="middle">L0..11  MLP (down)[d/2:, :]</text>
+
+    <rect x="48" y="448" width="200" height="16" rx="3" fill="rgba(245,166,35,0.03)"/>
+    <text x="148" y="460" fill="var(--text-dim)" font-family="var(--mono)" font-size="7.5" text-anchor="middle">≈ 250 MB params (bf16)</text>
+
+    <!-- Target KV-Cache shard 0 -->
+    <rect x="268" y="310" width="196" height="100" rx="7" fill="var(--cache-dim)" stroke="var(--cache)" stroke-width="1" stroke-dasharray="5 3"/>
+    <text x="284" y="330" fill="var(--cache)" font-family="var(--mono)" font-size="9.5" font-weight="600">Target KV-Cache (shard 0)</text>
+    <text x="284" y="346" fill="var(--text-dim)" font-family="var(--mono)" font-size="8">(12, 2, B, 2048, kv_h/2, 64)</text>
+    <text x="284" y="360" fill="var(--text-dim)" font-family="var(--mono)" font-size="8">heads dim split matches W_k/W_v</text>
+    <text x="284" y="378" fill="var(--text-dim)" font-family="var(--mono)" font-size="8">≈ 192 MB · static pre-allocated</text>
+
+    <!-- Replicated small weights -->
+    <rect x="268" y="420" width="196" height="44" rx="5" fill="rgba(226,232,240,0.02)" stroke="rgba(226,232,240,0.1)" stroke-width="0.6"/>
+    <text x="366" y="438" fill="var(--text-dim)" font-family="var(--mono)" font-size="8" text-anchor="middle">Replicated: RMSNorm · RoPE freqs</text>
+    <text x="366" y="452" fill="var(--text-dim)" font-family="var(--mono)" font-size="7.5" text-anchor="middle">embed_tokens P("model",None) · lm_head P(None,"model")</text>
+
+    <!-- GPU 0 total -->
+    <text x="256" y="498" fill="var(--gpu0)" font-family="var(--mono)" font-size="9" text-anchor="middle" font-weight="600">GPU 0 TOTAL ≈ 500 MB used</text>
+
+    <!-- ==================== NVLink BUS ==================== -->
+    <rect x="506" y="100" width="48" height="340" rx="6" fill="rgba(245,166,35,0.04)" stroke="var(--nvlink)" stroke-width="1.2"/>
+    <text x="530" y="260" fill="var(--nvlink)" font-family="var(--mono)" font-size="8.5" font-weight="700" text-anchor="middle" transform="rotate(-90 530 260)">NVLink  600 GB/s</text>
+
+    <!-- NVLink arrows -->
+    <line x1="530" y1="115" x2="530" y2="140" stroke="var(--nvlink)" stroke-width="1.2" marker-end="url(#a-amber)" opacity="0.5"/>
+    <line x1="530" y1="420" x2="530" y2="395" stroke="var(--nvlink)" stroke-width="1.2" marker-end="url(#a-amber)" opacity="0.5"/>
+    <text x="530" y="278" fill="var(--text-dim)" font-family="var(--mono)" font-size="7" text-anchor="middle">all_reduce</text>
+    <text x="530" y="290" fill="var(--text-dim)" font-family="var(--mono)" font-size="7" text-anchor="middle">after W_o</text>
+    <text x="530" y="302" fill="var(--text-dim)" font-family="var(--mono)" font-size="7" text-anchor="middle">after MLP_down</text>
+
+    <!-- ==================== GPU 1 ENCLOSURE ==================== -->
+    <rect x="564" y="16" width="480" height="488" rx="12" fill="var(--surface)" stroke="var(--gpu1)" stroke-width="1.5" filter="url(#noise)"/>
+    <rect x="564" y="16" width="480" height="32" rx="12" fill="rgba(155,89,245,0.08)"/>
+    <rect x="564" y="36" width="480" height="12" fill="rgba(155,89,245,0.08)"/>
+    <circle cx="582" cy="32" r="4" fill="var(--gpu1)" opacity="0.6"/>
+    <text x="596" y="37" fill="var(--gpu1)" font-family="var(--mono)" font-size="11" font-weight="700">GPU 1</text>
+    <text x="1008" y="37" fill="var(--text-dim)" font-family="var(--mono)" font-size="9" text-anchor="end">XLA Graph #2 (shard 1)</text>
+
+    <!-- No draft on GPU 1 -->
+    <rect x="584" y="62" width="220" height="50" rx="8" fill="rgba(226,232,240,0.015)" stroke="var(--border)" stroke-width="0.8" stroke-dasharray="5 3"/>
+    <text x="694" y="84" fill="var(--text-dim)" font-family="var(--mono)" font-size="8.5" text-anchor="middle" opacity="0.4">No draft model</text>
+    <text x="694" y="98" fill="var(--text-dim)" font-family="var(--mono)" font-size="7.5" text-anchor="middle" opacity="0.3">Draft is entirely on GPU 0</text>
+
+    <!-- TARGET SHARD 1 -->
+    <rect x="584" y="132" width="440" height="340" rx="8" fill="var(--target-dim)" stroke="var(--target)" stroke-width="1.2"/>
+    <text x="600" y="152" fill="var(--target)" font-family="var(--mono)" font-size="10" font-weight="700">TARGET MODEL — SHARD 1/2</text>
+    <text x="1008" y="152" fill="var(--text-dim)" font-family="var(--mono)" font-size="8" text-anchor="end">XLA Graph #2 (this device's half)</text>
+    <text x="600" y="168" fill="var(--text-dim)" font-family="var(--mono)" font-size="8.5">Mirror of shard 0 — other half of weight matrices</text>
+
+    <!-- Target weight blocks GPU 1 -->
+    <rect x="596" y="182" width="200" height="19" rx="3" fill="rgba(245,166,35,0.07)" stroke="rgba(245,166,35,0.18)" stroke-width="0.6"/>
+    <text x="696" y="195" fill="var(--target)" font-family="var(--mono)" font-size="8" text-anchor="middle">L0..11  W_q[:, h/2:h]</text>
+    <rect x="596" y="204" width="200" height="19" rx="3" fill="rgba(245,166,35,0.07)" stroke="rgba(245,166,35,0.18)" stroke-width="0.6"/>
+    <text x="696" y="217" fill="var(--target)" font-family="var(--mono)" font-size="8" text-anchor="middle">L0..11  W_k[:, kv_h/2:kv_h]</text>
+    <rect x="596" y="226" width="200" height="19" rx="3" fill="rgba(245,166,35,0.07)" stroke="rgba(245,166,35,0.18)" stroke-width="0.6"/>
+    <text x="696" y="239" fill="var(--target)" font-family="var(--mono)" font-size="8" text-anchor="middle">L0..11  W_v[:, kv_h/2:kv_h]</text>
+    <rect x="596" y="248" width="200" height="19" rx="3" fill="rgba(245,166,35,0.07)" stroke="rgba(245,166,35,0.18)" stroke-width="0.6"/>
+    <text x="696" y="261" fill="var(--target)" font-family="var(--mono)" font-size="8" text-anchor="middle">L0..11  W_o[:h/2, :]</text>
+    <rect x="596" y="270" width="200" height="19" rx="3" fill="rgba(245,166,35,0.07)" stroke="rgba(245,166,35,0.18)" stroke-width="0.6"/>
+    <text x="696" y="283" fill="var(--target)" font-family="var(--mono)" font-size="8" text-anchor="middle">L0..11  MLP (gate+up)[:, d/2:d]</text>
+    <rect x="596" y="292" width="200" height="19" rx="3" fill="rgba(245,166,35,0.07)" stroke="rgba(245,166,35,0.18)" stroke-width="0.6"/>
+    <text x="696" y="305" fill="var(--target)" font-family="var(--mono)" font-size="8" text-anchor="middle">L0..11  MLP (down)[:d/2, :]</text>
+
+    <rect x="596" y="320" width="200" height="16" rx="3" fill="rgba(245,166,35,0.03)"/>
+    <text x="696" y="332" fill="var(--text-dim)" font-family="var(--mono)" font-size="7.5" text-anchor="middle">≈ 250 MB params (bf16)</text>
+
+    <!-- Target KV-Cache shard 1 -->
+    <rect x="816" y="182" width="196" height="100" rx="7" fill="var(--cache-dim)" stroke="var(--cache)" stroke-width="1" stroke-dasharray="5 3"/>
+    <text x="832" y="202" fill="var(--cache)" font-family="var(--mono)" font-size="9.5" font-weight="600">Target KV-Cache (shard 1)</text>
+    <text x="832" y="218" fill="var(--text-dim)" font-family="var(--mono)" font-size="8">(12, 2, B, 2048, kv_h/2, 64)</text>
+    <text x="832" y="232" fill="var(--text-dim)" font-family="var(--mono)" font-size="8">mirrors shard 0 — other heads</text>
+    <text x="832" y="250" fill="var(--text-dim)" font-family="var(--mono)" font-size="8">≈ 192 MB · static pre-allocated</text>
+
+    <!-- Replicated on GPU 1 -->
+    <rect x="596" y="348" width="414" height="44" rx="5" fill="rgba(226,232,240,0.02)" stroke="rgba(226,232,240,0.1)" stroke-width="0.6"/>
+    <text x="803" y="366" fill="var(--text-dim)" font-family="var(--mono)" font-size="8" text-anchor="middle">Replicated: RMSNorm · RoPE freqs</text>
+    <text x="803" y="380" fill="var(--text-dim)" font-family="var(--mono)" font-size="7.5" text-anchor="middle">embed_tokens P("model",None) · lm_head P(None,"model")</text>
+
+    <!-- Shared tokenizer annotation -->
+    <rect x="596" y="406" width="414" height="48" rx="6" fill="rgba(226,232,240,0.015)" stroke="var(--border)" stroke-width="0.6"/>
+    <text x="803" y="425" fill="var(--text-dim)" font-family="var(--mono)" font-size="9" text-anchor="middle" font-weight="500">SHARED VOCABULARY: 32,000 tokens</text>
+    <text x="803" y="441" fill="var(--text-dim)" font-family="var(--mono)" font-size="8" text-anchor="middle">V1: Dummy integer IDs → V2: Gemma SentencePiece</text>
+
+    <!-- GPU 1 total -->
+    <text x="804" y="498" fill="var(--gpu1)" font-family="var(--mono)" font-size="9" text-anchor="middle" font-weight="600">GPU 1 TOTAL ≈ 450 MB used</text>
+  </svg>
+</div>
+
+<!-- PART 2: SEQUENCE -->
+<div class="section-label">PART 2 — SEQUENCE: THE SPECULATIVE DECODING PROTOCOL</div>
+<div class="sequence-container">
+  <svg class="sequence-svg" width="1060" height="640" viewBox="0 0 1060 640">
+    <defs>
+      <marker id="s-white" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--text)"/></marker>
+      <marker id="s-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--accept)"/></marker>
+      <marker id="s-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--target)"/></marker>
+      <marker id="s-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--gpu1)"/></marker>
+      <marker id="s-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--reject)"/></marker>
+      <marker id="s-cyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--cache)"/></marker>
+      <!-- Reverse markers -->
+      <marker id="sr-green" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M10 0L0 5L10 10z" fill="var(--accept)"/></marker>
+      <marker id="sr-red" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M10 0L0 5L10 10z" fill="var(--reject)"/></marker>
+      <marker id="sr-cyan" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M10 0L0 5L10 10z" fill="var(--cache)"/></marker>
+    </defs>
+
+    <!-- ACTOR HEADERS -->
+    <!-- CLI -->
+    <rect x="60" y="16" width="110" height="38" rx="6" fill="var(--surface2)" stroke="var(--border-lit)" stroke-width="1.2"/>
+    <text x="115" y="40" fill="var(--text-bright)" font-family="var(--mono)" font-size="10" text-anchor="middle" font-weight="600">CLI / demo.py</text>
+    <line x1="115" y1="54" x2="115" y2="620" stroke="var(--border)" stroke-width="1.2" stroke-dasharray="6 5"/>
+
+    <!-- Draft -->
+    <rect x="260" y="16" width="150" height="38" rx="6" fill="var(--draft-dim)" stroke="var(--draft)" stroke-width="1.2"/>
+    <text x="335" y="32" fill="var(--draft)" font-family="var(--mono)" font-size="10" text-anchor="middle" font-weight="700">Draft (GPU 0)</text>
+    <text x="335" y="46" fill="var(--text-dim)" font-family="var(--mono)" font-size="7.5" text-anchor="middle">XLA Graph #1</text>
+    <line x1="335" y1="54" x2="335" y2="620" stroke="rgba(0,196,143,0.15)" stroke-width="1.2" stroke-dasharray="6 5"/>
+
+    <!-- Target -->
+    <rect x="520" y="16" width="170" height="38" rx="6" fill="var(--target-dim)" stroke="var(--target)" stroke-width="1.2"/>
+    <text x="605" y="32" fill="var(--target)" font-family="var(--mono)" font-size="10" text-anchor="middle" font-weight="700">Target (GPU 0+1)</text>
+    <text x="605" y="46" fill="var(--text-dim)" font-family="var(--mono)" font-size="7.5" text-anchor="middle">XLA Graph #2 · TP=2</text>
+    <line x1="605" y1="54" x2="605" y2="620" stroke="rgba(245,166,35,0.15)" stroke-width="1.2" stroke-dasharray="6 5"/>
+
+    <!-- Verifier -->
+    <rect x="790" y="16" width="130" height="38" rx="6" fill="rgba(155,89,245,0.08)" stroke="var(--gpu1)" stroke-width="1.2"/>
+    <text x="855" y="32" fill="var(--gpu1)" font-family="var(--mono)" font-size="10" text-anchor="middle" font-weight="700">Verifier</text>
+    <text x="855" y="46" fill="var(--text-dim)" font-family="var(--mono)" font-size="7.5" text-anchor="middle">Rejection Sampler</text>
+    <line x1="855" y1="54" x2="855" y2="620" stroke="rgba(155,89,245,0.12)" stroke-width="1.2" stroke-dasharray="6 5"/>
+
+    <!-- STEP LABELS (left column) -->
+    <text x="24" y="94" fill="var(--text-dim)" font-family="var(--mono)" font-size="8" font-weight="600">INIT</text>
+
+    <!-- MSG 1: User sends prompt -->
+    <line x1="115" y1="88" x2="330" y2="88" stroke="var(--text)" stroke-width="1.2" marker-end="url(#s-white)"/>
+    <text x="222" y="83" fill="var(--text)" font-family="var(--mono)" font-size="8.5" text-anchor="middle">prompt_tokens[]</text>
+
+    <!-- MSG 2: Prefill both -->
+    <rect x="305" y="100" width="60" height="32" rx="4" fill="rgba(0,196,143,0.08)"/>
+    <text x="335" y="120" fill="var(--draft)" font-family="var(--mono)" font-size="8" text-anchor="middle" font-weight="600">prefill</text>
+
+    <line x1="365" y1="110" x2="600" y2="110" stroke="var(--target)" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#s-amber)" opacity="0.5"/>
+    <text x="482" y="105" fill="var(--target)" font-family="var(--mono)" font-size="7.5" text-anchor="middle" opacity="0.6">prefill target in parallel</text>
+
+    <rect x="575" y="100" width="60" height="32" rx="4" fill="rgba(245,166,35,0.08)"/>
+    <text x="605" y="120" fill="var(--target)" font-family="var(--mono)" font-size="8" text-anchor="middle" font-weight="600">prefill</text>
+
+    <!-- TTFT measurement -->
+    <line x1="48" y1="88" x2="48" y2="140" stroke="var(--cache)" stroke-width="1" opacity="0.4"/>
+    <line x1="44" y1="88" x2="52" y2="88" stroke="var(--cache)" stroke-width="1" opacity="0.4"/>
+    <line x1="44" y1="140" x2="52" y2="140" stroke="var(--cache)" stroke-width="1" opacity="0.4"/>
+    <text x="46" y="118" fill="var(--cache)" font-family="var(--mono)" font-size="6.5" text-anchor="middle" transform="rotate(-90 46 118)" opacity="0.6">TTFT</text>
+
+    <!-- ==================== LOOP BOX ==================== -->
+    <rect x="56" y="152" width="904" height="435" rx="10" fill="none" stroke="var(--cache)" stroke-width="1.2" opacity="0.4"/>
+    <rect x="56" y="152" width="130" height="22" rx="5" fill="rgba(0,180,216,0.08)"/>
+    <text x="121" y="167" fill="var(--cache)" font-family="var(--mono)" font-size="8.5" text-anchor="middle" font-weight="700">loop [ until EOS ]</text>
+    <text x="921" y="167" fill="var(--text-dim)" font-family="var(--mono)" font-size="7.5" text-anchor="end">jax.lax.while_loop</text>
+
+    <!-- STEP ① Draft -->
+    <text x="24" y="208" fill="var(--draft)" font-family="var(--mono)" font-size="9" font-weight="700">①</text>
+    <text x="24" y="222" fill="var(--text-dim)" font-family="var(--mono)" font-size="7">Draft</text>
+    <text x="24" y="232" fill="var(--text-dim)" font-family="var(--mono)" font-size="7">K=5</text>
+
+    <rect x="303" y="188" width="64" height="68" rx="5" fill="rgba(0,196,143,0.06)" stroke="rgba(0,196,143,0.2)" stroke-width="0.8"/>
+    <text x="335" y="208" fill="var(--draft)" font-family="var(--mono)" font-size="8.5" text-anchor="middle" font-weight="600">generate</text>
+    <text x="335" y="222" fill="var(--draft)" font-family="var(--mono)" font-size="8" text-anchor="middle">5 tokens</text>
+    <text x="335" y="236" fill="var(--text-dim)" font-family="var(--mono)" font-size="7" text-anchor="middle">autoregressive</text>
+    <text x="335" y="248" fill="var(--text-dim)" font-family="var(--mono)" font-size="7" text-anchor="middle">fori_loop</text>
+
+    <!-- STEP ② Send to target -->
+    <text x="24" y="284" fill="var(--target)" font-family="var(--mono)" font-size="9" font-weight="700">②</text>
+    <text x="24" y="298" fill="var(--text-dim)" font-family="var(--mono)" font-size="7">Send</text>
+
+    <line x1="367" y1="280" x2="600" y2="280" stroke="var(--target)" stroke-width="1.5" marker-end="url(#s-amber)"/>
+    <text x="483" y="273" fill="var(--target)" font-family="var(--mono)" font-size="8.5" text-anchor="middle" font-weight="500">draft_tokens[0..5], draft_probs[0..5]</text>
+    <text x="483" y="293" fill="var(--text-dim)" font-family="var(--mono)" font-size="7" text-anchor="middle">on-device transfer · no host roundtrip</text>
+
+    <!-- STEP ③ Target verifies -->
+    <text x="24" y="332" fill="var(--target)" font-family="var(--mono)" font-size="9" font-weight="700">③</text>
+    <text x="24" y="346" fill="var(--text-dim)" font-family="var(--mono)" font-size="7">Verify</text>
+
+    <rect x="573" y="308" width="64" height="62" rx="5" fill="rgba(245,166,35,0.06)" stroke="rgba(245,166,35,0.2)" stroke-width="0.8"/>
+    <text x="605" y="328" fill="var(--target)" font-family="var(--mono)" font-size="8.5" text-anchor="middle" font-weight="600">forward</text>
+    <text x="605" y="342" fill="var(--target)" font-family="var(--mono)" font-size="8" text-anchor="middle">1 pass</text>
+    <text x="605" y="356" fill="var(--text-dim)" font-family="var(--mono)" font-size="7" text-anchor="middle">all 5 tokens</text>
+    <text x="605" y="366" fill="var(--text-dim)" font-family="var(--mono)" font-size="7" text-anchor="middle">parallel</text>
+
+    <!-- NVLink annotation -->
+    <text x="660" y="330" fill="var(--nvlink)" font-family="var(--mono)" font-size="7" opacity="0.5">← all_reduce</text>
+    <text x="660" y="342" fill="var(--nvlink)" font-family="var(--mono)" font-size="7" opacity="0.5">   via NVLink</text>
+
+    <!-- STEP ④ Send probs to verifier -->
+    <text x="24" y="402" fill="var(--gpu1)" font-family="var(--mono)" font-size="9" font-weight="700">④</text>
+    <text x="24" y="416" fill="var(--text-dim)" font-family="var(--mono)" font-size="7">Accept/</text>
+    <text x="24" y="426" fill="var(--text-dim)" font-family="var(--mono)" font-size="7">Reject</text>
+
+    <line x1="637" y1="390" x2="850" y2="390" stroke="var(--gpu1)" stroke-width="1.5" marker-end="url(#s-purple)"/>
+    <text x="743" y="384" fill="var(--gpu1)" font-family="var(--mono)" font-size="8.5" text-anchor="middle" font-weight="500">target_probs[0..5]</text>
+
+    <!-- Verifier box -->
+    <rect x="823" y="403" width="64" height="52" rx="5" fill="rgba(155,89,245,0.06)" stroke="rgba(155,89,245,0.2)" stroke-width="0.8"/>
+    <text x="855" y="422" fill="var(--gpu1)" font-family="var(--mono)" font-size="8" text-anchor="middle" font-weight="600">reject</text>
+    <text x="855" y="436" fill="var(--gpu1)" font-family="var(--mono)" font-size="8" text-anchor="middle">sample</text>
+    <text x="855" y="448" fill="var(--text-dim)" font-family="var(--mono)" font-size="7" text-anchor="middle">p_t / p_d</text>
+
+    <!-- STEP ⑤ Accept → CLI -->
+    <text x="24" y="480" fill="var(--accept)" font-family="var(--mono)" font-size="9" font-weight="700">⑤</text>
+    <text x="24" y="494" fill="var(--text-dim)" font-family="var(--mono)" font-size="7">Output</text>
+
+    <line x1="823" y1="472" x2="120" y2="472" stroke="var(--accept)" stroke-width="1.5" marker-end="url(#sr-green)"/>
+    <text x="471" y="466" fill="var(--accept)" font-family="var(--mono)" font-size="8.5" text-anchor="middle" font-weight="600">✓ accepted_tokens  (n ≤ 5)</text>
+
+    <!-- CLI prints -->
+    <rect x="92" y="478" width="46" height="22" rx="3" fill="rgba(226,232,240,0.04)"/>
+    <text x="115" y="493" fill="var(--text)" font-family="var(--mono)" font-size="7.5" text-anchor="middle">print</text>
+
+    <!-- STEP ⑥ Rollback -->
+    <text x="24" y="528" fill="var(--reject)" font-family="var(--mono)" font-size="9" font-weight="700">⑥</text>
+    <text x="24" y="542" fill="var(--text-dim)" font-family="var(--mono)" font-size="7">Rollback</text>
+
+    <line x1="823" y1="520" x2="340" y2="520" stroke="var(--reject)" stroke-width="1.2" marker-end="url(#sr-red)" stroke-dasharray="5 3" opacity="0.7"/>
+    <text x="580" y="514" fill="var(--reject)" font-family="var(--mono)" font-size="8" text-anchor="middle" opacity="0.8">rollback draft + target KV-cache to pos n_accepted</text>
+
+    <!-- STEP ⑦ Bonus token -->
+    <text x="24" y="564" fill="var(--cache)" font-family="var(--mono)" font-size="9" font-weight="700">⑦</text>
+    <text x="24" y="578" fill="var(--text-dim)" font-family="var(--mono)" font-size="7">Bonus</text>
+
+    <line x1="823" y1="552" x2="120" y2="552" stroke="var(--cache)" stroke-width="1" marker-end="url(#sr-cyan)" stroke-dasharray="4 3" opacity="0.6"/>
+    <text x="471" y="546" fill="var(--cache)" font-family="var(--mono)" font-size="8" text-anchor="middle" opacity="0.8">+1 bonus token from adjusted target distribution</text>
+
+    <!-- METRICS BAR -->
+    <rect x="70" y="600" width="880" height="28" rx="6" fill="var(--surface2)" stroke="var(--border)" stroke-width="0.8"/>
+    <text x="90" y="618" fill="var(--gpu0)" font-family="var(--mono)" font-size="8" font-weight="600">📊 INLINE STATS:</text>
+    <text x="220" y="618" fill="var(--text-dim)" font-family="var(--mono)" font-size="8">Tokens/sec</text>
+    <text x="330" y="618" fill="var(--text-dim)" font-family="var(--mono)" font-size="8">TTFT (ms)</text>
+    <text x="438" y="618" fill="var(--text-dim)" font-family="var(--mono)" font-size="8">Acceptance Rate (n/K)</text>
+    <text x="620" y="618" fill="var(--text-dim)" font-family="var(--mono)" font-size="8">Avg Accepted/Round</text>
+    <text x="800" y="618" fill="var(--text-dim)" font-family="var(--mono)" font-size="8">Wall Time</text>
+  </svg>
+</div>
+
+</body>
+</html>
