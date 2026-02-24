@@ -155,7 +155,9 @@ Larger batch sizes amortize fixed dispatch overhead, giving much higher throughp
 
 ```bash
 pip install -e .
-pip install -e ".[dev]"   # include pytest
+pip install -e ".[dev]"      # include pytest
+pip install -e ".[gemma]"    # V2 Gemma SentencePiece tokenizer
+pip install -e ".[profile]"  # TensorBoard XLA profiling
 ```
 
 **Hardware:** 2× NVIDIA GPU with ≥8 GB VRAM (CUDA 12.x + cuDNN 9+).
@@ -193,6 +195,9 @@ python demo.py --help
 | `--seed` | `42` | Model initialization seed |
 | `--warmup` | `1` | Warmup runs before timing (compiles XLA graph) |
 | `--runs` | `3` | Number of timed benchmark runs |
+| `--tokenizer` | `dummy` | `dummy` (V1) \| `gemma` (V2 — requires `[gemma]` extra) |
+| `--profile` | `false` | Enable XLA TensorBoard trace + HLO dump |
+| `--profile-dir` | `/tmp/xla_trace` | Output directory for profile artefacts |
 
 ---
 
@@ -208,12 +213,102 @@ Sharding tests are skipped automatically when fewer than 2 JAX devices are avail
 
 ---
 
+## Tokenizer
+
+### V1 — DummyTokenizer (default)
+
+Maps each character to `ord(c) % vocab_size`. No real vocabulary; output is
+`[123] [456]` placeholder tokens. Used for pipeline and sharding correctness
+testing — no external downloads needed.
+
+### V2 — Gemma SentencePiece tokenizer (optional)
+
+Uses the Gemma model's SentencePiece vocabulary via HuggingFace `transformers`.
+
+```bash
+pip install -e ".[gemma]"
+```
+
+Before running, update **both** `ModelConfig` and `DraftConfig` in
+`configs/model_config.py`:
+
+```python
+vocab_size: int = 256_000   # Gemma has 256 k tokens (was 32 000)
+```
+
+Then pass `--tokenizer gemma` on the CLI:
+
+```bash
+python demo.py --mode speculative --tokenizer gemma --prompt "The meaning of life"
+```
+
+> **Note:** Gemma weights are gated on HuggingFace Hub. Run
+> `huggingface-cli login` and accept the model licence before first use.
+
+---
+
+## XLA Profiling (optional)
+
+Install the profiling extras:
+
+```bash
+pip install -e ".[profile]"   # tensorboard + tensorboard-plugin-profile
+```
+
+### TensorBoard trace
+
+```bash
+python demo.py --mode xla --profile --profile-dir /tmp/xla_trace
+tensorboard --logdir /tmp/xla_trace/trace
+```
+
+### Programmatic use
+
+```python
+from benchmark.profiler import trace_to, dump_hlo, profile_and_dump
+
+# TensorBoard trace only
+with trace_to("/tmp/xla_trace"):
+    result = generate_xla(prompt)
+
+# HLO IR dump only (no extra deps required)
+with dump_hlo("/tmp/hlo_dump"):
+    jax.jit(my_fn)(args)
+
+# Both at once
+with profile_and_dump("/tmp/run1") as dirs:
+    result = speculative_decode(prompt)
+# dirs == {"trace": "/tmp/run1/trace", "hlo": "/tmp/run1/hlo"}
+```
+
+`dump_hlo` writes `*.before_optimizations.txt` and `*.after_optimizations.txt`
+files that show the XLA HLO IR before and after optimisation passes — useful
+for understanding fusion, layout assignment, and sharding decisions.
+
+---
+
+## CI
+
+A GitHub Actions workflow lives at `.github/workflows/ci.yml`.  It runs on
+every push and pull request:
+
+| Job | What it does |
+|-----|-------------|
+| `test` | Installs CPU-only JAX, sets `XLA_FLAGS=--xla_force_host_platform_device_count=2` to simulate 2 devices, and runs `pytest -q tests/` on Python 3.10 and 3.11. |
+| `lint` | Runs `ruff check` for style errors. |
+
+No GPU is required in CI — the same `XLA_FLAGS` trick used for local development
+lets the full sharding and speculative-decode test suite pass on standard
+hosted runners.
+
+---
+
 ## Notes
 
 - **Random weights:** Default initialization uses random weights, so decoded output is token IDs like `[123] [456]` rather than natural language. This is intentional — the goal is to validate the pipeline and sharding mechanics, not produce meaningful text.
 - **DummyTokenizer:** Maps each character to `ord(c) % vocab_size`. For pipeline testing only.
-- **Gemma tokenizer (optional):** Install with `pip install -e ".[gemma]"` and switch to `GemmaTokenizer`. Requires updating `vocab_size=256_000` in both `ModelConfig` and `DraftConfig`.
-- **XLA profiling (optional):** Use `benchmark/profiler.py` and view with `tensorboard --logdir /tmp/xla_trace`.
+- **Gemma tokenizer (optional):** See the [Tokenizer](#tokenizer) section above.
+- **XLA profiling (optional):** See the [XLA Profiling](#xla-profiling-optional) section above.
 
 ---
 

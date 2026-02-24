@@ -1,4 +1,12 @@
-"""Speculative decoding orchestration (draft -> verify -> accept/reject)."""
+"""
+Speculative decoding orchestration — outer round loop compiled with jax.lax.while_loop.
+
+Draft inner loop:  jax.lax.fori_loop (k steps)
+Target verify:     single parallel forward pass on all k draft tokens
+Accept/reject:     vectorised rejection sampling with jnp.cumprod
+Bonus token:       sampled via jax.lax.cond on the adjusted distribution
+Cache rollback:    position counter reset only; stale entries are masked by causal attention
+"""
 
 from __future__ import annotations
 
@@ -32,21 +40,6 @@ class SpeculativeResult:
         return self.accepted_tokens / self.proposed_tokens
 
 
-def _tiny_softmax_probs(logits: jnp.ndarray, token_id: int) -> tuple[float, jnp.ndarray]:
-    probs = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
-    return float(probs[token_id]), probs
-
-
-def _advance_cache(model: Transformer, cache: KVCache, tokens: list[int], pos: int) -> KVCache:
-    cur_cache = cache
-    cur_pos = pos
-    for tok in tokens:
-        tok_arr = jnp.array([[tok]], dtype=jnp.int32)
-        _, cur_cache = model(tok_arr, cur_cache, pos=cur_pos)
-        cur_pos += 1
-    return cur_cache
-
-
 def speculative_decode(
     prompt: str,
     *,
@@ -58,10 +51,17 @@ def speculative_decode(
     tokenizer: DummyTokenizer | None = None,
 ) -> SpeculativeResult:
     """
-    Python-orchestrated speculative decoding with separate draft/target models.
+    Speculative decoding with the outer round loop compiled via jax.lax.while_loop.
 
-    This keeps model forward passes in JAX while the accept/reject control logic
-    remains explicit and easy to validate.
+    Pipeline per round
+    ------------------
+    1. Draft fori_loop (k steps): generates k draft tokens + their probability distributions.
+    2. Target parallel verify: one forward pass on all k draft tokens at once.
+    3. Vectorised rejection sampling: accept the longest matching prefix.
+    4. All-accepted branch  → last draft token becomes the new seed; advance pos by k.
+       Some-rejected branch → sample bonus token from adjusted distribution; feed it
+                              through both model caches; advance pos by n_accepted + 1.
+    5. Repeat until EOS or max_new_tokens.
     """
     if target_config is None:
         target_config = ModelConfig()
@@ -79,113 +79,204 @@ def speculative_decode(
     if target_config.d_model != draft_config.d_model:
         raise ValueError("target and draft d_model must match")
 
+    vocab_size = target_config.vocab_size
+    eos_id = tokenizer.eos_id
+
     target = Transformer(target_config, rngs=nnx.Rngs(params=seed))
-    draft = Transformer(draft_config, rngs=nnx.Rngs(params=seed + 1))
+    draft  = Transformer(draft_config,  rngs=nnx.Rngs(params=seed + 1))
 
     target_cache = KVCache.init(target_config, batch_size=1)
-    draft_cache = KVCache.init(draft_config, batch_size=1)
+    draft_cache  = KVCache.init(draft_config,  batch_size=1)
 
-    prompt_ids = tokenizer.encode(prompt)
-    prompt_arr = jnp.array([prompt_ids], dtype=jnp.int32)
-    target_logits, target_cache = target(prompt_arr, target_cache, pos=0)
-    _, draft_cache = draft(prompt_arr, draft_cache, pos=0)
+    # Prefill both caches with the prompt.
+    prompt_ids  = tokenizer.encode(prompt)
+    prompt_arr  = jnp.array([prompt_ids], dtype=jnp.int32)
+    t_logits, target_cache = target(prompt_arr, target_cache, pos=0)
+    _,        draft_cache  = draft( prompt_arr, draft_cache,  pos=0)
 
-    last_token = int(jnp.argmax(target_logits[0, -1]))
-    cur_pos = len(prompt_ids)
-    generated: list[int] = []
-    accepted_total = 0
-    proposed_total = 0
-    rounds = 0
-    key = jax.random.PRNGKey(seed)
+    first_token = jnp.argmax(t_logits[0, -1]).astype(jnp.int32)
+    start_pos   = jnp.asarray(len(prompt_ids), dtype=jnp.int32)
+    prng_key    = jax.random.PRNGKey(seed)
 
-    while len(generated) < max_new_tokens:
-        rounds += 1
-        round_start_draft = draft_cache
-        round_start_target = target_cache
-        round_pos = cur_pos
+    # ------------------------------------------------------------------
+    # Compiled speculative loop.  Both models are captured by closure so
+    # their parameters are treated as JIT constants (not loop state).
+    # All loop state is a pytree of JAX arrays.
+    # ------------------------------------------------------------------
+    @jax.jit
+    def _compiled_loop(
+        d_cache: KVCache,
+        t_cache: KVCache,
+        first_tok: jnp.ndarray,
+        start_p: jnp.ndarray,
+        key: jnp.ndarray,
+    ):
+        out_buf  = jnp.zeros((max_new_tokens,), dtype=jnp.int32)
+        init_state = (
+            out_buf,
+            jnp.asarray(0,     jnp.int32),   # n_generated
+            first_tok,                         # last_token (seed for next draft round)
+            start_p,                           # cur_pos
+            d_cache,
+            t_cache,
+            key,
+            jnp.asarray(False),               # done
+            jnp.asarray(0,     jnp.int32),   # rounds
+            jnp.asarray(0,     jnp.int32),   # accepted_total
+            jnp.asarray(0,     jnp.int32),   # proposed_total
+        )
 
-        draft_tokens: list[int] = []
-        draft_token_probs: list[float] = []
-        draft_step_logits: list[jnp.ndarray] = []
+        def cond_fn(state):
+            _, n_gen, _, _, _, _, _, done, _, _, _ = state
+            return (~done) & (n_gen < max_new_tokens)
 
-        next_tok = last_token
-        for _ in range(min(k, max_new_tokens - len(generated))):
-            tok_arr = jnp.array([[next_tok]], dtype=jnp.int32)
-            d_logits, draft_cache = draft(tok_arr, draft_cache, pos=cur_pos)
-            prob, full_probs = _tiny_softmax_probs(d_logits[0, -1], next_tok)
-            draft_tokens.append(next_tok)
-            draft_token_probs.append(prob)
-            draft_step_logits.append(full_probs)
-            proposed_total += 1
-            cur_pos += 1
-            next_tok = int(jnp.argmax(d_logits[0, -1]))
+        def body_fn(state):
+            out_buf, n_gen, last_tok, cur_pos, d_cache, t_cache, key, done, rounds, acc_total, prop_total = state
 
-        accepted_this_round = 0
-        rejected = False
-        bonus_token: int | None = None
+            # --------------------------------------------------------------
+            # 1. Draft phase — generate k tokens via fori_loop.
+            #    draft_tokens[i] = token fed into the draft at step i.
+            #    draft_probs[i]  = probability distribution output at step i.
+            # --------------------------------------------------------------
+            tok_buf   = jnp.zeros((k,),            dtype=jnp.int32)
+            probs_buf = jnp.zeros((k, vocab_size), dtype=jnp.float32)
 
-        cur_pos = round_pos
-        for i, proposed_tok in enumerate(draft_tokens):
-            tok_arr = jnp.array([[proposed_tok]], dtype=jnp.int32)
-            t_logits, target_cache = target(tok_arr, target_cache, pos=cur_pos)
-            t_prob, target_probs = _tiny_softmax_probs(t_logits[0, -1], proposed_tok)
-            d_prob = max(draft_token_probs[i], 1e-8)
-            accept_prob = min(t_prob / d_prob, 1.0)
+            def draft_step(i, ds):
+                dc, pos, tok, tb, pb = ds
+                logits, new_dc = draft(tok.reshape(1, 1).astype(jnp.int32), dc, pos=pos)
+                probs    = jax.nn.softmax(logits[0, -1].astype(jnp.float32))
+                next_tok = jnp.argmax(logits[0, -1]).astype(jnp.int32)
+                return new_dc, pos + 1, next_tok, tb.at[i].set(tok), pb.at[i].set(probs)
 
-            key, sub = jax.random.split(key)
-            u = float(jax.random.uniform(sub))
-            if u <= accept_prob:
-                accepted_this_round += 1
-                cur_pos += 1
-                continue
-
-            rejected = True
-            adjusted = jnp.maximum(target_probs - draft_step_logits[i], 0.0)
-            denom = jnp.sum(adjusted)
-            sampled_probs = jnp.where(
-                denom > 0,
-                adjusted / denom,
-                target_probs,
+            d_cache_new, _, _, draft_tokens, draft_probs = jax.lax.fori_loop(
+                0, k, draft_step, (d_cache, cur_pos, last_tok, tok_buf, probs_buf)
             )
-            key, sub2 = jax.random.split(key)
-            bonus_token = int(jax.random.categorical(sub2, jnp.log(sampled_probs + 1e-8)))
-            break
 
-        accepted_tokens = draft_tokens[:accepted_this_round]
-        accepted_total += accepted_this_round
-        generated.extend(accepted_tokens)
+            # --------------------------------------------------------------
+            # 2. Target parallel verify — one forward pass on all k tokens.
+            #    Causal masking ensures target_probs[i] conditions only on
+            #    positions 0..cur_pos+i, identical to running token-by-token.
+            # --------------------------------------------------------------
+            t_logits, t_cache_new = target(
+                draft_tokens.reshape(1, k).astype(jnp.int32), t_cache, pos=cur_pos
+            )
+            target_probs = jax.nn.softmax(t_logits[0].astype(jnp.float32), axis=-1)  # (k, vocab)
 
-        # Rebuild both caches from round start using accepted prefix only.
-        draft_cache = _advance_cache(draft, round_start_draft, accepted_tokens, round_pos)
-        target_cache = _advance_cache(target, round_start_target, accepted_tokens, round_pos)
-        cur_pos = round_pos + accepted_this_round
+            # --------------------------------------------------------------
+            # 3. Vectorised rejection sampling.
+            # --------------------------------------------------------------
+            arange_k   = jnp.arange(k)
+            d_tok_p    = draft_probs[ arange_k, draft_tokens]        # (k,)
+            t_tok_p    = target_probs[arange_k, draft_tokens]        # (k,)
+            accept_p   = jnp.minimum(t_tok_p / jnp.maximum(d_tok_p, 1e-8), 1.0)
 
-        if len(generated) >= max_new_tokens:
-            break
+            key, sub   = jax.random.split(key)
+            uniform_s  = jax.random.uniform(sub, shape=(k,))
+            accepted   = uniform_s <= accept_p                        # (k,) bool
+            # n_accepted = length of the leading run of True values.
+            n_accepted = jnp.sum(
+                jnp.cumprod(accepted.astype(jnp.int32))
+            ).astype(jnp.int32)
+            all_accepted = n_accepted == k
 
-        if rejected and bonus_token is not None:
-            generated.append(bonus_token)
-            draft_cache = _advance_cache(draft, draft_cache, [bonus_token], cur_pos)
-            target_cache = _advance_cache(target, target_cache, [bonus_token], cur_pos)
-            cur_pos += 1
-            last_token = bonus_token
-        elif draft_tokens:
-            last_token = draft_tokens[-1]
-        else:
-            break
+            # --------------------------------------------------------------
+            # 4. Write accepted tokens to output buffer.
+            # --------------------------------------------------------------
+            def write_one(i, buf):
+                return jax.lax.cond(
+                    (i < n_accepted) & (n_gen + i < max_new_tokens),
+                    lambda b: b.at[n_gen + i].set(draft_tokens[i]),
+                    lambda b: b,
+                    operand=buf,
+                )
 
-        if generated and generated[-1] == tokenizer.eos_id:
-            break
+            out_buf    = jax.lax.fori_loop(0, k, write_one, out_buf)
+            n_gen_after = jnp.minimum(n_gen + n_accepted, max_new_tokens)
 
-    all_ids = list(prompt_ids) + generated
+            # --------------------------------------------------------------
+            # 5. Bonus token from the adjusted distribution.
+            #    When all k accepted: sample from target at position k-1.
+            #    When some rejected: sample from max(target - draft, 0) at
+            #                        the first rejected position.
+            # --------------------------------------------------------------
+            bonus_idx = jnp.minimum(
+                jnp.where(all_accepted, k - 1, n_accepted), k - 1
+            )
+            t_at  = jax.lax.dynamic_slice(target_probs, (bonus_idx, 0), (1, vocab_size))[0]
+            d_at  = jax.lax.dynamic_slice(draft_probs,  (bonus_idx, 0), (1, vocab_size))[0]
+
+            adj     = jnp.maximum(t_at - d_at, 0.0)
+            adj_sum = jnp.sum(adj)
+            adj     = jnp.where(adj_sum > 0, adj / adj_sum, t_at)
+
+            key, sub2  = jax.random.split(key)
+            bonus_tok  = jax.random.categorical(sub2, jnp.log(adj + 1e-8)).astype(jnp.int32)
+
+            # --------------------------------------------------------------
+            # 6. Branch: all accepted vs some rejected.
+            #    Both branches receive the same operand pytree.
+            # --------------------------------------------------------------
+            def all_acc_fn(args):
+                dc, tc, ng, pos, buf = args
+                # No bonus token; last draft token seeds the next round.
+                return dc, tc, draft_tokens[k - 1], pos + k, ng, buf
+
+            def some_rej_fn(args):
+                dc, tc, ng, pos, buf = args
+                bpos      = pos + n_accepted
+                bonus_arr = bonus_tok.reshape(1, 1).astype(jnp.int32)
+                # Feed bonus token through both caches at the rejection position.
+                _, new_dc = draft( bonus_arr, dc, pos=bpos)
+                _, new_tc = target(bonus_arr, tc, pos=bpos)
+                # Append bonus token to output if within budget.
+                new_buf = jax.lax.cond(
+                    ng < max_new_tokens,
+                    lambda b: b.at[ng].set(bonus_tok),
+                    lambda b: b,
+                    operand=buf,
+                )
+                new_ng = jnp.minimum(ng + 1, max_new_tokens)
+                return new_dc, new_tc, bonus_tok, bpos + 1, new_ng, new_buf
+
+            d_cache_fin, t_cache_fin, last_tok_fin, cur_pos_fin, n_gen_fin, out_buf = (
+                jax.lax.cond(
+                    all_accepted,
+                    all_acc_fn,
+                    some_rej_fn,
+                    operand=(d_cache_new, t_cache_new, n_gen_after, cur_pos, out_buf),
+                )
+            )
+
+            # EOS check over the accepted slice and the bonus token.
+            eos_in_accepted = jnp.any((draft_tokens == eos_id) & (arange_k < n_accepted))
+            bonus_is_eos    = (~all_accepted) & (bonus_tok == eos_id)
+            done_new        = done | eos_in_accepted | bonus_is_eos | (n_gen_fin >= max_new_tokens)
+
+            return (
+                out_buf, n_gen_fin, last_tok_fin, cur_pos_fin,
+                d_cache_fin, t_cache_fin, key, done_new,
+                rounds + 1, acc_total + n_accepted, prop_total + k,
+            )
+
+        final = jax.lax.while_loop(cond_fn, body_fn, init_state)
+        out_buf, n_gen, _, _, _, _, _, _, rounds, acc_total, prop_total = final
+        return out_buf, n_gen, rounds, acc_total, prop_total
+
+    out_buf, n_gen, rounds, acc_total, prop_total = _compiled_loop(
+        draft_cache, target_cache, first_token, start_pos, prng_key
+    )
+    out_buf.block_until_ready()
+
+    n_gen      = int(n_gen)
+    generated  = [int(x) for x in out_buf[:n_gen]]
+    all_ids    = list(prompt_ids) + generated
     return SpeculativeResult(
         prompt_ids=prompt_ids,
         generated_ids=generated,
         all_ids=all_ids,
         decoded_generated_text=tokenizer.decode(generated),
         decoded_all_text=tokenizer.decode(all_ids),
-        rounds=rounds,
-        accepted_tokens=accepted_total,
-        proposed_tokens=proposed_total,
+        rounds=int(rounds),
+        accepted_tokens=int(acc_total),
+        proposed_tokens=int(prop_total),
     )
-
