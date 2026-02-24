@@ -52,7 +52,6 @@ tests/
 
 ## Architecture Visual
 
-[Open the full architecture HTML](plan/xla_sharded_architecture.html)
 
 ![XLA-Sharded architecture preview](architecture_demo.png)
 
@@ -66,14 +65,35 @@ tests/
 - `speculative`: draft proposes `k` tokens, target verifies/accepts/rejects, then rolls forward.
 4. Output token IDs are decoded as bracketed IDs (`[123]`), since defaults use random weights and dummy tokenization.
 
-## Timeline
+## End-to-End Plot (How Draft Speeds Up Target)
 
-Planned delivery timeline from `plan/XLA_SHARDED_PLAN_FINAL.md`:
-- Days 1-3: model stack + tokenizer + core validation
-- Days 4-5: single-device generation baseline
-- Days 6-8: sharding + XLA generation path
-- Days 9-12: speculative decoding orchestration
-- Days 13-16: benchmarking, CLI polish, tests, docs
+```mermaid
+flowchart LR
+    A["Prompt: Hello World"] --> B["tokenizer.encode"]
+    B --> C["Prefill both caches\nDraft KV (GPU0)\nTarget KV (GPU0+GPU1, planned sharded)"]
+
+    subgraph N["Naive target-only path"]
+      N1["Generate 1 token"] --> N2["Run TARGET forward once"]
+      N2 --> N3["Repeat for every token"]
+    end
+
+    subgraph S["Speculative path (K=5)"]
+      S1["Draft model (small) proposes 5 tokens\non GPU0"] --> S2["Transfer proposal: token IDs + draft probs\nto target verify stage"]
+      S2 --> S3["Target model (large) verifies all 5 in one pass\n(parallel verify)"]
+      S3 --> S4["Accept prefix, reject tail if needed,\nadd bonus token, update caches"]
+      S4 --> S1
+    end
+
+    C --> N
+    C --> S
+
+    S --> O["Fewer expensive TARGET passes per output token\n=> higher tokens/sec when acceptance is good"]
+```
+
+Speedup intuition from the plan:
+- Target model is the expensive model.
+- Without speculation, target runs once per token.
+- With speculation, draft proposes `K` tokens and target verifies in bulk, reducing how often the expensive target path runs per emitted token.
 
 ## Installation
 
