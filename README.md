@@ -50,6 +50,12 @@ tests/
     └── tokenizer.py
 ```
 
+## Architecture Visual
+
+[Open the full architecture HTML](plan/xla_sharded_architecture.html)
+
+![XLA-Sharded architecture preview](plan/xla_sharded_architecture.html.png)
+
 ## How It Works
 
 1. Prompt is tokenized by `DummyTokenizer`.
