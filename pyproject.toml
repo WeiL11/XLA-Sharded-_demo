@@ -1,0 +1,25 @@
+[project]
+name = "xla-sharded"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "jax[cuda12]>=0.4.35",
+    "flax>=0.10.0",
+    "jaxlib>=0.4.35",
+    "numpy",
+    "rich>=13.0",
+    "typer>=0.9",
+]
+
+[project.optional-dependencies]
+gemma = ["transformers", "sentencepiece"]
+dev = ["pytest", "pytest-xdist"]
+profile = ["tensorboard", "tensorboard-plugin-profile"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
