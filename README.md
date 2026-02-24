@@ -141,3 +141,15 @@ pytest -q
 - Default weights are random initialization, so decoded outputs are token IDs rather than meaningful text.
 - `DummyTokenizer` is intentionally simple for pipeline validation.
 - Sharding tests are skipped automatically when fewer than 2 JAX devices are available.
+
+## Practical Optimization Discussion
+
+In practice, speculative decoding optimization should be done in this order:
+
+1. Optimize the **target model path** first (this is the expensive baseline).
+2. Measure the available **speculative budget window** (how much draft+verify overhead still keeps you faster than target-only decode).
+3. Optimize the **draft model** inside that budget to maximize acceptance rate per unit compute cost.
+4. Tune **`k`** jointly with draft quality (`k` too small underuses speculation, `k` too large increases rejection/rollback overhead).
+5. Add adaptive runtime control (dynamic `k` and fallback when acceptance drops).
+
+Core principle: reduce effective target work per emitted token while keeping draft overhead under the speedup threshold.
