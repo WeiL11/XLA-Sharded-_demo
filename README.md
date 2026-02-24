@@ -54,7 +54,7 @@ tests/
 
 [Open the full architecture HTML](plan/xla_sharded_architecture.html)
 
-![XLA-Sharded architecture preview](plan/xla_sharded_architecture.html.png)
+![XLA-Sharded architecture preview](architecture_demo.png)
 
 ## How It Works
 
