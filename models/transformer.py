@@ -70,7 +70,7 @@ class Transformer(nnx.Module):
         x = self.embed(tokens).astype(jnp.bfloat16)  # (batch, seq_len, d_model)
 
         for layer in self.layers:
-            x, kv_cache = layer(x, kv_cache, pos, self.rope_cos.value, self.rope_sin.value)
+            x, kv_cache = layer(x, kv_cache, pos, self.rope_cos[...], self.rope_sin[...])
 
         x = self.norm(x)
         logits = self.lm_head(x)  # (batch, seq_len, vocab_size)

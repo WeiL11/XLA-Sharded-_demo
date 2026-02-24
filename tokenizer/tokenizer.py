@@ -23,7 +23,8 @@ class DummyTokenizer:
     pad_id: int = 0
 
     def encode(self, text: str) -> list[int]:
-        return [self.bos_id] + [hash(c) % self.vocab_size for c in text]
+        # Use a stable character mapping so token IDs are reproducible across runs.
+        return [self.bos_id] + [ord(c) % self.vocab_size for c in text]
 
     def decode(self, ids: list[int]) -> str:
         special = {self.bos_id, self.eos_id, self.pad_id}

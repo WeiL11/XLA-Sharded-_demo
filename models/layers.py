@@ -26,7 +26,7 @@ class RMSNorm(nnx.Module):
         # Upcast to float32 for numerical stability, then restore input dtype.
         x_f32 = x.astype(jnp.float32)
         rms = jnp.sqrt(jnp.mean(x_f32 ** 2, axis=-1, keepdims=True) + self.eps)
-        normed = (x_f32 / rms) * self.scale.value.astype(jnp.float32)
+        normed = (x_f32 / rms) * self.scale[...].astype(jnp.float32)
         return normed.astype(x.dtype)
 
 
