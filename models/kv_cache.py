@@ -1,5 +1,6 @@
 from typing import NamedTuple
 
+import jax
 import jax.numpy as jnp
 
 
@@ -36,12 +37,20 @@ class KVCache(NamedTuple):
         """
         Write new K and V at positions [pos, pos + seq_len).
 
-        Uses .at[].set() which compiles to lax.dynamic_update_slice under JIT,
-        supporting dynamic pos values inside jax.lax.while_loop.
+        Uses lax.dynamic_update_slice so traced pos values are JIT-safe
+        in generation loops.
         """
-        seq_len = new_k.shape[1]
-        new_data = self.data.at[layer_idx, 0, :, pos : pos + seq_len, :, :].set(new_k)
-        new_data = new_data.at[layer_idx, 1, :, pos : pos + seq_len, :, :].set(new_v)
+        new_k = new_k.astype(self.data.dtype)
+        new_v = new_v.astype(self.data.dtype)
+
+        layer_k = self.data[layer_idx, 0]
+        layer_v = self.data[layer_idx, 1]
+
+        layer_k = jax.lax.dynamic_update_slice(layer_k, new_k, (0, pos, 0, 0))
+        layer_v = jax.lax.dynamic_update_slice(layer_v, new_v, (0, pos, 0, 0))
+
+        new_data = self.data.at[layer_idx, 0].set(layer_k)
+        new_data = new_data.at[layer_idx, 1].set(layer_v)
         return KVCache(data=new_data)
 
     def read(self, layer_idx: int) -> tuple[jnp.ndarray, jnp.ndarray]:
