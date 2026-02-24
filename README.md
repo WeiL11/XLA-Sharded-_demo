@@ -2,7 +2,6 @@
 
 Built a JAX/Flax NNX inference system with static KV-cache, XLA decode loops, speculative draft/target verification, and tensor-parallel sharding utilities.
 
-XLA-Sharded is an ML systems demo focused on correctness and architecture clarity for modern inference pipelines.
 
 ## What It Does
 
@@ -11,6 +10,26 @@ XLA-Sharded is an ML systems demo focused on correctness and architecture clarit
 - Three decode paths: `naive`, `xla`, `speculative`
 - Sharding helpers (`Mesh`, `NamedSharding`, `PartitionSpec`)
 - Benchmark/report modules for throughput and acceptance metrics
+
+## Best Usage Maps
+
+### 1) Batch/Sequence Best Usage
+
+![Batch/Sequence best usage map](figures/bs_seq_best_usage.png)
+
+Short discussion:
+- In this benchmark, larger batch sizes gave much higher throughput because fixed compute/dispatch overhead is amortized across more tokens.
+- Sequence length helps until memory/compute pressure dominates; the best observed point in this run was `batch=512, seq=16`.
+- This is why the “best cell” is at high batch with moderate/short sequence for the tested setup.
+
+### 2) Best `k` for Speculative Speed
+
+![Best k for speculative speed](figures/spec_k_best_usage.png)
+
+Short discussion:
+- `k` controls proposal length: too small underuses speculative verification, too large increases rejection/rollback overhead.
+- In the recorded experiment, `k=5` gave the best average speedup overall.
+- The optimal `k` depends on draft-target alignment (acceptance rate): better alignment tolerates larger `k`; poorer alignment favors smaller `k`.
 
 ## Design Structure (Plan + Code)
 
